@@ -1,0 +1,33 @@
+# Large data folder
+data/
+
+# Animatediff checkpoints
+animatediff/checkpoints/
+animatediff/checkpoints_outdoor/
+animatediff/checkpoints_clean/
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual envs
+venv/
+.venv/
+
+# Tensorboard/logging
+logs/
+wandb/
+runs/
+events.out.tfevents*
+# Large models/checkpoints
+animatediff/checkpoints*/
+animatediff/models/
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Nested git repo
+animatediff/repo/

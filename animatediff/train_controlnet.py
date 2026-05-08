@@ -766,7 +766,6 @@
 
 
 
-
 import sys
 import os
 import torch
@@ -776,10 +775,8 @@ from diffusers import AnimateDiffPipeline, DDIMScheduler, MotionAdapter
 import json
 from tqdm import tqdm
 from PIL import Image, ImageDraw
-import torchvision.utils as vutils
 import numpy as np
 
-# WandB — offline mode works without internet
 os.environ['WANDB_MODE'] = 'offline'
 import wandb
 
@@ -791,60 +788,58 @@ from controlnet.controlnet_model import DepthControlNet
 # ── Config ───────────────────────────────────────────────────────────────────
 MODEL_PATH  = '/data/Jayin/ltx/animatediff/models/sd-v1-5'
 DATA_DIR    = '/data/Jayin/ltx/data/processed'
-CKPT_DIR    = '/data/Jayin/ltx/animatediff/checkpoints_landscape_v2'
-CLIP_LIST   = '/data/Jayin/ltx/animatediff/landscape_clips.json'
-RESUME_FROM = None
+CKPT_DIR    = '/data/Jayin/ltx/animatediff/checkpoints_landscape_v5'
+CLIP_LIST   = '/data/Jayin/ltx/animatediff/landscape_clips_v2.json'
+RESUME_FROM = '/data/Jayin/ltx/animatediff/checkpoints_landscape_v5/step_030000.pt'
 
 BATCH_SIZE  = 1
-LR          = 1e-5
+# LR          = 1e-5
+LR          = 5e-6
 MAX_STEPS   = 30000
 SAVE_EVERY  = 1000
 LOG_EVERY   = 10
 VIS_EVERY   = 500
-VAL_STEPS   = 30       # faster validation — 30 steps enough to detect collapse
+VAL_STEPS   = 10       # fast validation — enough to detect collapse
 NUM_WORKERS = 4
-COND_DROP   = 0.15     # conditioning dropout rate
+COND_DROP   = 0.15
 
 os.makedirs(CKPT_DIR, exist_ok=True)
+os.makedirs('/data/Jayin/ltx/animatediff/logs/wandb', exist_ok=True)
 
-# ── Init WandB ────────────────────────────────────────────────────────────────
+# ── WandB ─────────────────────────────────────────────────────────────────────
 wandb.init(
     project='animatediff_controlnet',
-    name='landscape_v2_condrop',
+    name='landscape_v5_diversity_loss',
     config={
-        'lr': LR,
-        'max_steps': MAX_STEPS,
-        'batch_size': BATCH_SIZE,
-        'cond_dropout': COND_DROP,
-        'dataset': 'landscape_787clips',
-        'clip_list': CLIP_LIST,
+        'lr': LR, 'max_steps': MAX_STEPS,
+        'batch_size': BATCH_SIZE, 'cond_dropout': COND_DROP,
+        'recon_weight': 0.5, 'div_weight': 1.0,
         'val_steps': VAL_STEPS,
     },
     dir='/data/Jayin/ltx/animatediff/logs/wandb'
 )
-os.makedirs('/data/Jayin/ltx/animatediff/logs/wandb', exist_ok=True)
-print(f"WandB run: {wandb.run.name}  (offline mode)")
+print(f"WandB: {wandb.run.name} (offline)")
 
 # ── Load pipeline ─────────────────────────────────────────────────────────────
-print("Loading AnimateDiff pipeline...")
+print("Loading pipeline...")
 adapter = MotionAdapter.from_pretrained(
-    'guoyww/animatediff-motion-adapter-v1-5-2', local_files_only=True
-)
+    'guoyww/animatediff-motion-adapter-v1-5-2', local_files_only=True)
 scheduler = DDIMScheduler.from_pretrained(
     MODEL_PATH, subfolder='scheduler',
     clip_sample=False, beta_schedule='linear',
-    timestep_spacing='linspace', steps_offset=1
-)
+    timestep_spacing='linspace', steps_offset=1)
 pipe = AnimateDiffPipeline.from_pretrained(
     MODEL_PATH, motion_adapter=adapter,
-    scheduler=scheduler, torch_dtype=torch.float16
-)
+    scheduler=scheduler, torch_dtype=torch.float16)
 pipe.to('cuda')
 
-unet=pipe.unet; vae=pipe.vae; text_enc=pipe.text_encoder; tokenizer=pipe.tokenizer
-unet.requires_grad_(False); vae.requires_grad_(False); text_enc.requires_grad_(False)
+unet=pipe.unet; vae=pipe.vae
+text_enc=pipe.text_encoder; tokenizer=pipe.tokenizer
+unet.requires_grad_(False)
+vae.requires_grad_(False)
+text_enc.requires_grad_(False)
 VAE_SCALE = vae.config.scaling_factor
-print(f"Pipeline loaded — GPU: {torch.cuda.memory_allocated()/1e9:.1f}GB used")
+print(f"Pipeline loaded — GPU: {torch.cuda.memory_allocated()/1e9:.1f}GB")
 
 # ── Build trainable modules ───────────────────────────────────────────────────
 print("\nBuilding ControlNet...")
@@ -853,9 +848,10 @@ controlnet        = DepthControlNet(unet).cuda().float()
 n_train = sum(p.numel() for p in controlnet.parameters()) + \
           sum(p.numel() for p in condition_encoder.parameters())
 print(f"Trainable: {n_train/1e6:.0f}M params")
+print(f"GPU free:  {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.1f}GB")
 
 if RESUME_FROM and os.path.exists(RESUME_FROM):
-    print(f"Resuming from: {RESUME_FROM}")
+    print(f"Resuming: {RESUME_FROM}")
     ckpt = torch.load(RESUME_FROM, map_location='cuda')
     controlnet.load_state_dict(ckpt['controlnet'])
     condition_encoder.load_state_dict(ckpt['condition_encoder'])
@@ -865,182 +861,155 @@ if RESUME_FROM and os.path.exists(RESUME_FROM):
 # ── Dataset ───────────────────────────────────────────────────────────────────
 print("\nLoading dataset...")
 with open(CLIP_LIST) as f:
-    landscape_clips = json.load(f)
-print(f"Landscape clips: {len(landscape_clips)}")
+    clips = json.load(f)
+print(f"Clips: {len(clips)}")
 
-train_ds = DepthVideoDataset(DATA_DIR, split='train', clip_list=landscape_clips)
-val_ds   = DepthVideoDataset(DATA_DIR, split='val',   clip_list=landscape_clips)
+train_ds = DepthVideoDataset(DATA_DIR, split='train', clip_list=clips)
+val_ds   = DepthVideoDataset(DATA_DIR, split='val',   clip_list=clips)
 train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                       num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
 val_dl   = DataLoader(val_ds, batch_size=1, shuffle=True, num_workers=2)
 print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
-# ── Pre-select 4 fixed val clips for consistent visual tracking ───────────────
-# Same 4 clips shown every validation — easy to track progress over time
-# Pick clips with highest depth std from val set
-val_depth_stats = []
-for i in range(len(val_ds)):
-    b = val_ds[i]
-    val_depth_stats.append((i, float(b['depth'].std()), b['caption']))
-val_depth_stats.sort(key=lambda x: x[1], reverse=True)
-# Take top 4 with spread-out captions
-FIXED_VAL_INDICES = [val_depth_stats[i][0] for i in [0, 1, 2, 3]]
-print(f"\nFixed val clips for visual tracking:")
-for idx in FIXED_VAL_INDICES:
+# ── Fixed val clips for visual tracking ───────────────────────────────────────
+val_stats = [(i, float(val_ds[i]['depth'].std()), val_ds[i]['caption'])
+             for i in range(len(val_ds))]
+val_stats.sort(key=lambda x: x[1], reverse=True)
+FIXED_VAL = [val_stats[i][0] for i in range(min(4, len(val_stats)))]
+print(f"\nFixed val clips:")
+for idx in FIXED_VAL:
     b = val_ds[idx]
-    print(f"  idx={idx}  std={b['depth'].std():.3f}  {b['caption'][:60]}")
+    print(f"  idx={idx} std={b['depth'].std():.3f} | {b['caption'][:60]}")
 
 # ── Optimizer + scaler ────────────────────────────────────────────────────────
 optimizer = torch.optim.AdamW(
-    list(controlnet.parameters()) + list(condition_encoder.parameters()),
-    lr=LR, weight_decay=1e-4
-)
+    list(controlnet.parameters()) +
+    list(condition_encoder.parameters()),
+    lr=LR, weight_decay=1e-4)
 scaler = torch.cuda.amp.GradScaler()
 
-# ── Validation function ───────────────────────────────────────────────────────
+# ── Validation ────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def run_validation(step):
     controlnet.eval()
     condition_encoder.eval()
 
-    # Fixed prompt — same every validation
-    FIXED_PROMPT   = 'outdoor landscape, natural scenery'
-    NEUTRAL_PROMPT = ''
-
+    PROMPT = 'outdoor landscape, natural scenery'
     with torch.cuda.amp.autocast():
-        tokens = tokenizer([FIXED_PROMPT], padding='max_length', max_length=77,
-                           truncation=True, return_tensors='pt').input_ids.cuda()
-        text_emb = text_enc(tokens).last_hidden_state.float()
+        tok   = tokenizer([PROMPT], padding='max_length', max_length=77,
+                          truncation=True, return_tensors='pt').input_ids.cuda()
+        t_emb = text_enc(tok).last_hidden_state.float()
+        etok  = tokenizer([''], padding='max_length', max_length=77,
+                          truncation=True, return_tensors='pt').input_ids.cuda()
+        e_emb = text_enc(etok).last_hidden_state.float()
 
-        empty_tokens = tokenizer([NEUTRAL_PROMPT], padding='max_length', max_length=77,
-                                 truncation=True, return_tensors='pt').input_ids.cuda()
-        empty_emb = text_enc(empty_tokens).last_hidden_state.float()
-
-    def denoise(depth, text_e, empty_e, seed=42):
+    def denoise(depth, seed=42):
         B,_,nf,H,W = depth.shape
-        text_exp  = text_e.unsqueeze(1).expand(-1,nf,-1,-1).reshape(B*nf,77,768)
-        empty_exp = empty_e.unsqueeze(1).expand(-1,nf,-1,-1).reshape(B*nf,77,768)
-
-        depth_2d = depth.permute(0,2,1,3,4).reshape(B*nf,1,H,W)
+        te = t_emb.unsqueeze(1).expand(-1,nf,-1,-1).reshape(B*nf,77,768)
+        ee = e_emb.unsqueeze(1).expand(-1,nf,-1,-1).reshape(B*nf,77,768)
+        d2 = depth.permute(0,2,1,3,4).reshape(B*nf,1,H,W)
         with torch.cuda.amp.autocast():
-            cf = condition_encoder(depth_2d)
+            cf = condition_encoder(d2, return_reconstruction=False)
             cf = cf.reshape(B,nf,4,64,64).permute(0,2,1,3,4)
-
         torch.manual_seed(seed)
         lat = torch.randn(B,4,nf,64,64,device='cuda',dtype=torch.float32)
         scheduler.set_timesteps(VAL_STEPS)
-
         for t in scheduler.timesteps:
             t_b = t.unsqueeze(0).cuda()
             with torch.cuda.amp.autocast():
-                dr, mr = controlnet(lat, cf, t_b, text_exp)
+                dr, mr = controlnet(lat, cf, t_b, te)
                 nc = unet(lat.half(), t_b,
-                    encoder_hidden_states=text_exp.half(),
+                    encoder_hidden_states=te.half(),
                     down_block_additional_residuals=tuple(r.half() for r in dr),
                     mid_block_additional_residual=mr.half()).sample.float()
                 nu = unet(lat.half(), t_b,
-                    encoder_hidden_states=empty_exp.half()).sample.float()
+                    encoder_hidden_states=ee.half()).sample.float()
                 noise = nu + 7.5*(nc - nu)
             lat = scheduler.step(noise, t, lat).prev_sample
-
         lat_2d = lat.permute(0,2,1,3,4).reshape(B*nf,4,64,64).half()
         frames = vae.decode(lat_2d / VAE_SCALE).sample.float()
-        return (frames.clamp(-1,1)+1)/2  # [nf, 3, H, W]
+        return (frames.clamp(-1,1)+1)/2
 
-    # ── Build the collapse-detection grid ─────────────────────────────────────
-    # Same structure as our fair_test — if all rows look identical = collapse
-    # Each row: depth_map | frame0 | frame1 | frame2 | frame3
+    # Build grid
     cell = 200
-    nf   = 4
-    grid_img = Image.new('RGB', (cell*5, cell*4 + 40*4 + 30), (15,15,15))
-    draw     = ImageDraw.Draw(grid_img)
-    draw.text((5,5), f'Step {step} | {FIXED_PROMPT} | seed=42', fill=(220,220,220))
+    grid = Image.new('RGB',
+                     (cell*5, cell*len(FIXED_VAL)+40*len(FIXED_VAL)+30),
+                     (15,15,15))
+    draw = ImageDraw.Draw(grid)
+    draw.text((5,5), f'Step {step} | {PROMPT} | seed=42', fill=(220,220,220))
 
-    depth_images   = []
-    gen_images     = []
-    residual_means = []
+    res_vecs  = []
+    cond_vars = []
 
-    for row, val_idx in enumerate(FIXED_VAL_INDICES):
-        b     = val_ds[val_idx]
+    for row, idx in enumerate(FIXED_VAL):
+        b     = val_ds[idx]
         depth = b['depth'].unsqueeze(0).cuda()
-        cap   = b['caption']
-        B,_,nf_d,H,W = depth.shape
+        B,_,nf,H,W = depth.shape
 
-        # Check residual magnitude — key collapse indicator
-        depth_2d = depth.permute(0,2,1,3,4).reshape(B*nf_d,1,H,W)
-        t_test   = torch.tensor([500], dtype=torch.long).cuda()
-        lat_test = torch.randn(B,4,nf_d,64,64,device='cuda')
-        text_exp_test = text_emb.unsqueeze(1).expand(-1,nf_d,-1,-1).reshape(B*nf_d,77,768)
+        d2     = depth.permute(0,2,1,3,4).reshape(B*nf,1,H,W)
+        t_test = torch.tensor([500],dtype=torch.long).cuda()
+        lat_t  = torch.randn(B,4,nf,64,64,device='cuda')
+        te_t   = t_emb.unsqueeze(1).expand(-1,nf,-1,-1).reshape(B*nf,77,768)
+
         with torch.cuda.amp.autocast():
-            cf_test = condition_encoder(depth_2d)
-            cf_test = cf_test.reshape(B,nf_d,4,64,64).permute(0,2,1,3,4)
-            dr_test, mr_test = controlnet(lat_test, cf_test, t_test, text_exp_test)
-        res_mean = float(mr_test.abs().mean())
-        residual_means.append(res_mean)
+            cf_t = condition_encoder(d2, return_reconstruction=False)
+            cf_r = cf_t.reshape(B,nf,4,64,64).permute(0,2,1,3,4)
+            _,mr = controlnet(lat_t, cf_r, t_test, te_t)
 
-        # Generate frames
-        frames = denoise(depth, text_emb, empty_emb, seed=42)
+        res_vecs.append(mr.float().flatten())
+        cond_vars.append(float(cf_r.var(dim=[2,3,4]).mean()))
 
+        frames = denoise(depth, seed=42)
         y = 30 + row*(cell+40)
-        draw.text((5, y-22), f'std={b["depth"].std():.3f} | {cap[:45]}', fill=(160,160,160))
+        draw.text((5, y-22),
+                  f'std={b["depth"].std():.3f} var={cond_vars[-1]:.4f} | {b["caption"][:40]}',
+                  fill=(160,160,160))
 
-        # Depth
+        # Depth panel
         dv = depth[0,:,0,:,:].repeat(3,1,1).float().cpu()
         dv = F_torch.interpolate(dv.unsqueeze(0),(cell,cell),
                                   mode='bilinear',align_corners=False).squeeze(0)
-        d_img = Image.fromarray((dv.permute(1,2,0).numpy()*255).astype('uint8'))
-        grid_img.paste(d_img, (0, y))
-        depth_images.append(wandb.Image(d_img, caption=f'depth_{row+1}'))
+        grid.paste(
+            Image.fromarray((dv.permute(1,2,0).numpy()*255).astype('uint8')),
+            (0, y))
 
         # Generated frames
-        row_gen = []
-        for fi in range(min(frames.shape[0], 4)):
+        for fi in range(min(frames.shape[0],4)):
             g = (frames[fi].permute(1,2,0).cpu().numpy()*255).astype('uint8')
             g_img = Image.fromarray(g).crop((0,0,512,470)).resize((cell,cell))
-            grid_img.paste(g_img, (cell*(fi+1), y))
-            row_gen.append(wandb.Image(g_img, caption=f'row{row+1}_frame{fi}'))
-        gen_images.extend(row_gen)
+            grid.paste(g_img, (cell*(fi+1), y))
 
-    # ── Save grid image ────────────────────────────────────────────────────────
+    # Collapse metric
+    import torch.nn.functional as F_nn
+    r    = [F_nn.normalize(v.unsqueeze(0),dim=1) for v in res_vecs]
+    sims = [(r[i]*r[j]).sum().item()
+            for i in range(len(r)) for j in range(i+1,len(r))]
+    avg_sim   = float(np.mean(sims)) if sims else 1.0
+    avg_var   = float(np.mean(cond_vars))
+    collapsed = avg_sim > 0.95
+
     grid_path = f'{CKPT_DIR}/val_step_{step:06d}.png'
-    grid_img.save(grid_path)
-
-    # ── Log everything to WandB ────────────────────────────────────────────────
-    avg_res = float(np.mean(residual_means))
+    grid.save(grid_path)
 
     wandb.log({
-        # Collapse detection grid — 4 rows, different depth maps, same prompt/seed
-        # If all rows look identical → collapse
-        'val/collapse_detection_grid': wandb.Image(grid_img,
-            caption=f'Step {step}: 4 depth maps, same prompt+seed. Identical=collapsed.'),
-
-        # Individual depth maps
-        'val/depth_map_row1': depth_images[0],
-        'val/depth_map_row2': depth_images[1],
-        'val/depth_map_row3': depth_images[2],
-        'val/depth_map_row4': depth_images[3],
-
-        # Individual generated frames (first frame of each clip)
-        'val/gen_row1_frame0': gen_images[0],
-        'val/gen_row2_frame0': gen_images[4],
-        'val/gen_row3_frame0': gen_images[8],
-        'val/gen_row4_frame0': gen_images[12],
-
-        # Residual magnitude — should stay >0.1, drop to ~0 = collapse
-        'val/mid_residual_mean': avg_res,
-        'val/step': step,
+        'val/collapse_grid':           wandb.Image(grid,
+            caption=f'Step {step} sim={avg_sim:.3f} var={avg_var:.4f}'),
+        'val/residual_avg_similarity': avg_sim,
+        'val/cond_feat_avg_var':       avg_var,
+        'val/collapsed':               int(collapsed),
     }, step=step)
 
-    tqdm.write(f'\n  [Step {step}] Val: mid_res_mean={avg_res:.4f}  '
-               f'{"⚠ COLLAPSING" if avg_res < 0.05 else "OK"}')
-    tqdm.write(f'  Saved: {grid_path}')
+    status = '⚠ COLLAPSED' if collapsed else '✓ OK'
+    tqdm.write(f'\n  [Step {step}] sim={avg_sim:.4f} var={avg_var:.4f} {status}')
+    tqdm.write(f'  Grid: {grid_path}')
 
     controlnet.train()
     condition_encoder.train()
 
 # ── Training loop ─────────────────────────────────────────────────────────────
-print(f"\nStarting training — {MAX_STEPS} steps")
-print(f"  LR: {LR} | Cond dropout: {COND_DROP} | Vis every: {VIS_EVERY}")
+print(f"\nStarting training v5")
+print(f"  LR:{LR} | Dropout:{COND_DROP} | Steps:{MAX_STEPS}")
+print(f"  Losses: diffusion + 0.5*recon + 1.0*diversity")
 print()
 
 controlnet.train()
@@ -1061,33 +1030,41 @@ while step < MAX_STEPS:
         caption = batch['caption']
         B,_,nf,H,W = video.shape
 
-        # VAE encode
+        # ── VAE encode ────────────────────────────────────────────────────
         with torch.no_grad():
             vid_2d  = video.half().permute(0,2,1,3,4).reshape(B*nf,3,H,W)
             latents = vae.encode(vid_2d).latent_dist.sample() * VAE_SCALE
             latents = latents.reshape(B,nf,4,64,64).permute(0,2,1,3,4).float()
             noise   = torch.randn_like(latents)
-            t       = torch.randint(0,scheduler.config.num_train_timesteps,
-                                    (B,),device='cuda',dtype=torch.long)
+            t       = torch.randint(0,
+                                    scheduler.config.num_train_timesteps,
+                                    (B,), device='cuda', dtype=torch.long)
             noisy   = scheduler.add_noise(latents, noise, t)
             tokens  = tokenizer(caption, padding='max_length',
                                 max_length=tokenizer.model_max_length,
-                                truncation=True, return_tensors='pt').input_ids.cuda()
-            text_emb_train = text_enc(tokens).last_hidden_state.float()
+                                truncation=True,
+                                return_tensors='pt').input_ids.cuda()
+            text_emb = text_enc(tokens).last_hidden_state.float()
 
-        text_exp = text_emb_train.unsqueeze(1).expand(-1,nf,-1,-1).reshape(B*nf,77,768)
+        text_exp = text_emb.unsqueeze(1).expand(-1,nf,-1,-1).reshape(B*nf,77,768)
         depth_2d = depth.permute(0,2,1,3,4).reshape(B*nf,1,H,W)
 
         with torch.cuda.amp.autocast():
-            cond_feat = condition_encoder(depth_2d)
+            # ── Condition encoder ──────────────────────────────────────────
+            cond_feat, depth_recon = condition_encoder(
+                depth_2d, return_reconstruction=True)
             cond_feat = cond_feat.reshape(B,nf,4,64,64).permute(0,2,1,3,4)
 
-            # ── Conditioning dropout ───────────────────────────────────────
-            # 15% of steps: zero condition → model learns unconditional path
-            # Prevents mode collapse, enables proper CFG at inference
+            # ── Diversity loss BEFORE dropout ──────────────────────────────
+            # var over spatial dims — zero if encoder outputs constant
+            feat_var = cond_feat.var(dim=[2,3,4])
+            div_loss = F_torch.relu(0.1 - feat_var).mean()
+
+            # ── Conditioning dropout AFTER diversity loss ──────────────────
             if torch.rand(1).item() < COND_DROP:
                 cond_feat = torch.zeros_like(cond_feat)
 
+            # ── ControlNet + frozen UNet ───────────────────────────────────
             down_res, mid_res = controlnet(noisy, cond_feat, t, text_exp)
             down_fp16 = tuple(r.half() for r in down_res)
             mid_fp16  = mid_res.half()
@@ -1099,43 +1076,53 @@ while step < MAX_STEPS:
                 mid_block_additional_residual=mid_fp16,
             ).sample.float()
 
-            loss = F_torch.mse_loss(noise_pred, noise)
+            # ── Losses ────────────────────────────────────────────────────
+            diffusion_loss = F_torch.mse_loss(noise_pred, noise)
+            recon_loss     = F_torch.mse_loss(depth_recon, depth_2d.float())
+            loss           = diffusion_loss + 0.5*recon_loss + 1.0*div_loss
 
+        # ── Backward ──────────────────────────────────────────────────────
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
-            list(controlnet.parameters()) + list(condition_encoder.parameters()),
-            max_norm=1.0
-        )
+            list(controlnet.parameters()) +
+            list(condition_encoder.parameters()),
+            max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
 
         step    += 1
         loss_val = loss.item()
 
-        # Scalar logging
+        # ── Log ───────────────────────────────────────────────────────────
         if step % LOG_EVERY == 0:
             wandb.log({
-                'train/loss':       loss_val,
-                'train/grad_scale': scaler.get_scale(),
-                'train/epoch':      epoch,
-                'train/gpu_gb':     torch.cuda.memory_allocated()/1e9,
+                'train/loss':           loss_val,
+                'train/diffusion_loss': diffusion_loss.item(),
+                'train/recon_loss':     recon_loss.item(),
+                'train/div_loss':       div_loss.item(),
+                'train/feat_var':       feat_var.mean().item(),
+                'train/grad_scale':     scaler.get_scale(),
+                'train/epoch':          epoch,
+                'train/gpu_gb':         torch.cuda.memory_allocated()/1e9,
             }, step=step)
 
         pbar.update(1)
         pbar.set_postfix({
             'loss':  f'{loss_val:.4f}',
-            'epoch': epoch,
+            'diff':  f'{diffusion_loss.item():.4f}',
+            'recon': f'{recon_loss.item():.4f}',
+            'div':   f'{div_loss.item():.4f}',
+            'var':   f'{feat_var.mean().item():.4f}',
             'gpu':   f'{torch.cuda.memory_allocated()/1e9:.1f}G',
-            'scale': f'{scaler.get_scale():.0f}'
         })
 
-        # Visual validation
+        # ── Visual validation ──────────────────────────────────────────────
         if step % VIS_EVERY == 0:
             run_validation(step)
 
-        # Checkpoint
+        # ── Checkpoint ────────────────────────────────────────────────────
         if step % SAVE_EVERY == 0:
             ckpt_path = f'{CKPT_DIR}/step_{step:06d}.pt'
             torch.save({
@@ -1157,7 +1144,4 @@ torch.save({
     'condition_encoder': condition_encoder.state_dict(),
     'optimizer': optimizer.state_dict(),
 }, f'{CKPT_DIR}/final.pt')
-print(f"\nTraining complete — {step} steps")
-
-
-
+print(f"\nDone — {step} steps")
